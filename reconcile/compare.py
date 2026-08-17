@@ -6,9 +6,12 @@ This module is intentionally pure over plain data so tests do not need the datab
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Iterable, Optional, Sequence
+
+logger = logging.getLogger("reconcile.compare")
 
 
 REASON_MISSING_IN_B = "missing_in_b"
@@ -26,6 +29,14 @@ ALL_REASONS = (
 
 @dataclass(frozen=True)
 class ARecord:
+    """A minimal, DB-free view of a System A record used by the comparison.
+
+    Why a dataclass instead of passing the Django model: the comparison logic
+    should not depend on the ORM. Using a plain, ``frozen`` (immutable) dataclass
+    lets tests construct fixtures in one line and guarantees the comparison never
+    accidentally mutates its input. Only the fields the algorithm needs live here.
+    """
+
     record_id: str
     location_id: str
     total_value: Optional[Decimal]
@@ -34,6 +45,13 @@ class ARecord:
 
 @dataclass(frozen=True)
 class BEntry:
+    """A DB-free view of a System B entry.
+
+    Why it carries both ``record_ref_raw`` and ``record_id_normalized``: the
+    normalized id is what we match on, but keeping the raw ref lets us explain
+    *why* an entry is an orphan (bad reference) when reporting to the user.
+    """
+
     entry_id: str
     record_ref_raw: str
     record_id_normalized: Optional[str]
@@ -44,6 +62,15 @@ class BEntry:
 
 @dataclass(frozen=True)
 class Disagreement:
+    """One reported disagreement, shaped for direct display in the table.
+
+    Why a dedicated result type instead of a dict: it documents exactly what a
+    disagreement contains, gives the API a stable contract, and makes the tests
+    assert on named fields rather than fragile dict keys. It holds both parsed
+    (``a_value``) and raw (``a_value_raw``) values so the UI can show the human
+    the original text while sorting/comparison uses the parsed number.
+    """
+
     reason: str
     record_id: Optional[str]
     location_id: str
@@ -57,6 +84,14 @@ class Disagreement:
 
 
 def _values_agree(a: Optional[Decimal], b: Optional[Decimal]) -> bool:
+    """Decide whether two parsed values count as "the same".
+
+    Why it is its own function: the null-handling rule is subtle and easy to get
+    wrong inline. Two missing values agree (nothing to disagree about), but a
+    value present on one side and absent on the other is a real disagreement
+    (e.g. System B's blank ``value`` for ``REC-1050`` vs System A's number). Naming
+    the rule keeps :func:`find_disagreements` readable and testable.
+    """
     if a is None and b is None:
         return True
     if a is None or b is None:
@@ -71,12 +106,27 @@ def find_disagreements(
     *,
     org_id: Optional[str] = None,
 ) -> list[Disagreement]:
-    """
-    Return disagreements between the two systems.
+    """Return every disagreement between System A and System B.
 
-    Tenant isolation: when org_id is set, only disagreements whose scoping
-    location belongs to that org are returned.
+    Why this is the single source of truth: the whole take-home hinges on this
+    decision, so it is one pure function with no I/O. Both the API and the tests
+    call it, which means a test that passes proves the behavior the API ships.
+
+    How it works and why in this order:
+      1. Index B by normalized id so each A record is a dict lookup, not a scan
+         over all B rows (clearer, and O(1) per record instead of O(n)).
+      2. Walk A records first to catch missing / duplicate / value disagreements.
+      3. Then walk B entries to catch orphans (B pointing at a non-existent A).
+      4. Finally apply the tenant filter, so the org scope is enforced in exactly
+         one place rather than being threaded through every branch above.
+
+    Tenant isolation: when ``org_id`` is set, only disagreements whose scoping
+    location belongs to that org are returned, so one tenant can never see
+    another's rows.
     """
+    # Index both sides once up front. a_by_id lets the orphan pass ask "does this
+    # A record exist?" cheaply; b_by_norm groups B entries per record so a count
+    # of >1 immediately reveals a duplicate.
     a_by_id = {r.record_id: r for r in a_records}
     b_by_norm: dict[Optional[str], list[BEntry]] = {}
     for entry in b_entries:
@@ -172,7 +222,16 @@ def find_disagreements(
         )
 
     if org_id is not None:
+        before = len(results)
         results = [d for d in results if d.org_id == org_id]
+        logger.debug(
+            "find_disagreements: filtered %d -> %d for org_id=%r",
+            before,
+            len(results),
+            org_id,
+        )
+    else:
+        logger.debug("find_disagreements: %d disagreements (no org filter)", len(results))
 
     return results
 
@@ -184,7 +243,15 @@ def disagreements_from_queryset(
     *,
     org_id: Optional[str] = None,
 ) -> list[Disagreement]:
-    """Adapter from Django model instances to find_disagreements."""
+    """Adapt Django model instances into the pure inputs of ``find_disagreements``.
+
+    Why this adapter exists: it is the seam between "Django world" (querysets,
+    model instances) and the "pure world" (plain dataclasses). Keeping the
+    translation here means :func:`find_disagreements` never imports Django and
+    stays trivially testable, while the view stays thin and just hands over
+    querysets. The ``location_org`` map is built once so the org lookup inside
+    the algorithm is a dict access rather than a query per row.
+    """
     location_org = {loc.location_id: loc.org_id for loc in locations_qs}
     a_records = [
         ARecord(

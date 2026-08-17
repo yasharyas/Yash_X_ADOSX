@@ -1,37 +1,57 @@
 # Decisions
 
-1. **Compare System A `total_value` to System B `value`.**  
-   Rejected: comparing `base_value`.  
-   Reasoning: most matching rows agree on `total_value`; several mismatches are exactly A’s `base_value` written into B, which is the bug we should surface.
+Each entry: the decision, the alternative rejected, and the reasoning that separated
+them. `CHOICES.md` has the longer version with more alternatives per decision.
 
-2. **Normalize messy `record_ref` values before matching.**  
-   Rejected: exact string equality on `record_ref`.  
-   Reasoning: dirty forms (`rec1034`, spaced `REC - 1070`, bare `1112`) still point at real A records and must not become false disagreements.
+1. **Compare System A `total_value` to System B `value`.**
+   Rejected: comparing `base_value`.
+   Reasoning: most matching rows agree on `total_value`, and three of the planted
+   mismatches are exactly A's `base_value` copied into B; comparing `base_value` would
+   hide the very bugs we are asked to find.
 
-3. **Store raw CSV strings plus nullable parsed fields.**  
-   Rejected: failing the import (or skipping the row) when a number/date will not parse.  
-   Reasoning: the brief requires dirty rows to survive; parse issues are recorded, not discarded.
+2. **Normalize messy `record_ref` values before matching.**
+   Rejected: exact string equality on `record_ref`.
+   Reasoning: `rec1034`, `' REC - 1070 '` and bare `1112` all point at real records, so
+   matching raw strings would manufacture false disagreements out of clean data.
 
-4. **Always flag duplicates, even when B values match each other and A.**  
-   Rejected: only flagging duplicates when values also differ.  
-   Reasoning: “entered twice” is its own disagreement class in the brief.
+3. **Store raw CSV text alongside nullable parsed fields plus a `parse_issues` list.**
+   Rejected: storing only the parsed value, or rejecting rows that fail to parse.
+   Reasoning: an unparseable number must cost neither the row nor the original text; the
+   issue list turns a silent drop into an auditable record of what was dirty and where.
 
-5. **Treat blank or unparseable B `value` as a value mismatch when A has a number.**  
-   Rejected: ignoring blanks as “no data to compare.”  
-   Reasoning: the systems do not agree on the amount; blank is still a reported disagreement.
+4. **Quarantine rows with a blank or duplicate natural key into `ImportAnomaly`, and
+   assert `rows_read == rows_stored + quarantined` per file.**
+   Rejected: `update_or_create` on the source identifier, reporting rows read.
+   Reasoning: keying on the source identifier let a duplicate key silently overwrite an
+   imported row while still being counted as imported; the quarantine keeps the row and
+   the reconciliation makes the loss impossible to miss.
 
-6. **Scope API results with a required `org_id` query param (no auth).**  
-   Rejected: returning the global list and filtering only in the UI.  
-   Reasoning: tenant isolation must be enforced server-side so one org cannot see another’s rows.
+5. **Always flag duplicates, even when the two B values match each other and A.**
+   Rejected: only flagging duplicates when the values also differ.
+   Reasoning: "the same record entered into System B twice" is its own disagreement class
+   in the brief; the duplication is the defect, independent of value.
 
-7. **Use SQLite for the take-home database.**  
-   Rejected: Postgres for “realism.”  
-   Reasoning: zero setup for a clean clone; 120-row dataset does not need a server DB.
+6. **Treat a blank or unparseable B value as a value mismatch when A has a number.**
+   Rejected: skipping the comparison as "no data to compare".
+   Reasoning: the two systems still do not agree on the amount, and treating blank as
+   silence would hide a real discrepancy (`REC-1050`).
 
-8. **Keep comparison in a pure function over plain data objects.**  
-   Rejected: embedding the rules only inside DRF views/querysets.  
-   Reasoning: the same logic is easy to unit test without HTTP or DB fixtures.
+7. **Pin the expected disagreement set for the real CSVs in a golden-set test.**
+   Rejected: relying only on unit tests built from hand-made fixtures.
+   Reasoning: fixtures verify the rules but not which fields are fed into them; swapping
+   `total_value` for `base_value` yields 118 disagreements with every fixture test green.
 
-9. **Django REST + Vite React SPA instead of Next.js.**  
-   Rejected: Next.js frontend.  
-   Reasoning: clearer back/front split for a one-day feature, with a proxy for local `/api` calls.
+8. **Enforce tenant scope server-side via a required `org_id` query parameter.**
+   Rejected: returning the global list and filtering in the React UI.
+   Reasoning: filtering client-side still sends every tenant's rows over the wire, which
+   is precisely the boundary the brief says must not be crossed.
+
+9. **Keep the comparison a pure function over plain frozen dataclasses.**
+   Rejected: expressing the rules inside DRF views, querysets, or SQL.
+   Reasoning: the same code path serves the API and the tests, so a passing test proves
+   the behavior that ships, with no HTTP or database fixtures needed.
+
+10. **Stack: Django REST + Vite React SPA on SQLite.**
+    Rejected: Next.js frontend; PostgreSQL.
+    Reasoning: a clear API/UI split suits a one-day feature, and SQLite keeps a clean
+    clone runnable with zero external setup for a 120-row dataset.

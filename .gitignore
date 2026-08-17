@@ -20,3 +20,9 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# AI tool configs (never committed)
+.claude/
+.cursor/
+.cursorignore
+*.cursorrules
